@@ -1,0 +1,253 @@
+#trigger:
+#- main
+
+#pool:
+#  vmImage: ubuntu latest
+parameters:
+  - name: sonarProjectKey
+    type: string
+    default: 'Default_Sonar_Project_Key'
+  - name: rg_name
+    type: string
+    default: 'eShopOnWeb'
+  - name: WebsiteName
+    type: string
+    default: 'eshop'
+  - name: eshopServerName
+    type: string
+    default: 'eshop'
+  - name: apiKey
+    type: string
+    default: 'apikey'
+
+extends: 
+  template: template.yaml
+  parameters:
+    stages:
+      - stage: Build
+        displayName: 'Build'
+        jobs:
+        - job: Build
+          steps:
+          - checkout: self
+            persistCredentials: true
+          - task: UseDotNet@2  
+            inputs:  
+              packageType: 'sdk'  
+              version: '7.x'
+          - task: DotNetCoreCLI@2
+            displayName: Restore 
+            inputs:
+              command: restore
+              projects: '**/*.csproj'
+          - task: DotNetCoreCLI@2
+            displayName: Build
+            inputs:
+              projects: '**/*.csproj'
+              arguments: '--configuration $(BuildConfiguration)'
+          - task: DotNetCoreCLI@2
+            displayName: Test
+            inputs:
+              command: test
+              projects: '[Tt]ests/**/*.csproj'
+              arguments: '--configuration $(BuildConfiguration) --collect:"Code coverage"'
+
+          - task: BuildQualityChecks@9
+            displayName: 'Check build quality'
+            inputs:
+              checkCoverage: true
+              coverageFailOption: fixed
+              coverageThreshold: 35
+          - task: OpenAICodeReview@1
+            env:
+              System.AccessToken: $(System.AccessToken)
+            inputs:
+              api_key: $(openaikey)
+              ai_model: 'gpt-4o-mini'
+              bugs: true
+              performance: true
+              best_practices: true
+              file_extensions: '.js,.ts,.css,.html,.cs'
+              file_excludes: 'file1.js,file2.py,secret.txt'
+              additional_prompts: 'Check security issues, Fix variable naming, Ensure consistent indentation, Review error handling approach'
+          - task: SonarQubePrepare@7
+            #condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              SonarQube: 'SonarQube'
+              scannerMode: 'dotnet'
+              projectKey: ${{ parameters.sonarProjectKey }}
+
+          - task: ms.advancedsecurity-tasks.codeql.init.AdvancedSecurity-Codeql-Init@1
+            #condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            displayName: 'Initialize CodeQL'
+            inputs:
+              languages: csharp
+              querysuite: security-and-quality
+          - task: DotNetCoreCLI@2
+            #condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            displayName: Build
+            inputs:
+              projects: '**/*.csproj'
+              arguments: '--configuration $(BuildConfiguration)'
+          - task: SonarQubeAnalyze@7
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              jdkversion: 'JAVA_HOME_17_X64'
+          - task: SonarQubePublish@7
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              pollingTimeoutSec: '300'
+          - task: ms.advancedsecurity-tasks.dependency-scanning.AdvancedSecurity-Dependency-Scanning@1
+            #condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            displayName: 'Dependency Scanning'
+
+          - task: ms.advancedsecurity-tasks.codeql.analyze.AdvancedSecurity-Codeql-Analyze@1
+            #condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            displayName: 'Perform CodeQL analysis'
+
+          - task: ms.advancedsecurity-tasks.codeql.enhance.AdvancedSecurity-Publish@1
+            #condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            displayName: 'Publish Results'
+          - task: SCANOSS@0
+            inputs:
+              dependenciesEnabled: false
+              dependenciesScope: 'prod'
+              sbomEnabled: true
+              policies: 'copyleft,undeclared'
+              policiesHaltOnFailure: false
+
+          - task: DotNetCoreCLI@2
+            displayName: Publish
+            inputs:
+              command: publish
+              publishWebProjects: True
+              arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)'
+              zipAfterPublish: True
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'
+            inputs:
+              PathtoPublish: '$(build.artifactstagingdirectory)'
+            condition: succeededOrFailed()
+          
+          - task: CopyFiles@2
+            displayName: 'Copy ARM template files'
+            inputs:
+              SourceFolder: env/eshopenv/
+              Contents: |
+                eShopOnWeb.param.json
+                eShopOnWebResource.json
+              TargetFolder: '$(build.artifactstagingdirectory)'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'
+            inputs:
+              PathtoPublish: '$(build.artifactstagingdirectory)'
+            #condition: succeededOrFailed()
+         
+
+
+      - stage: Test
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        dependsOn: Build
+        displayName: 'Test Deployment'
+        jobs:
+        - job: 'Creating_Infra'
+          steps:
+          - download: current
+            artifact: drop
+
+          - task: AzureResourceGroupDeployment@2
+            displayName: 'ARM Template deployment: Resource Group scope'
+            inputs:
+              azureSubscription: 'eShopOnWeb'
+              resourceGroupName: ${{ parameters.rg_name }}
+              location: 'Canada Central'
+              csmFile: '$(Agent.BuildDirectory)/drop/eShopOnWebResource.json'
+              csmParametersFile: '$(Agent.BuildDirectory)/drop/eShopOnWeb.param.json'
+              overrideParameters: '-WebsiteName  ${{ parameters.WebsiteName }} -eshop_ServerName  ${{ parameters.eshopServerName }}'
+            
+        - deployment: DeployWeb
+          dependsOn:
+          - Creating_Infra
+          displayName: Deploy to Test Environment
+
+          environment: 
+            name: 'Test'
+
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                - download: current
+                  artifact: drop
+                
+                - task: AzureWebApp@1
+                  displayName: 'Test deployment'
+                  inputs:
+                    azureSubscription: 'eShopOnWeb'
+                    appType: webApp
+                    appName: ${{ parameters.WebsiteName }}-test
+                    package: '$(Agent.BuildDirectory)/drop/Web.zip'
+
+        - job : 'Run_Security_Tests'
+          dependsOn: DeployWeb
+          steps:
+          - task: OwaspZapOnPremiseStart@0
+            displayName: 'OWASP Start'
+            inputs:
+              PortZapProxy: '8913'
+              KeyOwaspZapProxy: 'zap_key'
+              ControlMode: 'attack'
+              ExecutionType: 'docker'
+              ZaproxyVersion: 'zaproxy/zap-stable'
+              TimeToSleep: '10'
+          - task: OwaspZapScan@0
+            displayName: 'OWASP Scan'
+            inputs:
+              ZapApiUrl: 'http://localhost:8913'
+              ZapApiKey: 'zap_key'
+              TargetUrl: 'https://cs10capstone1-afencaaaf9d9dcf0.canadaeast-01.azurewebsites.net/api/calculator/'
+              ExecuteAjaxSpiderScan: true
+              ExecuteSpiderScan: true
+              ReportType: 'all'
+          - task: OwaspZapOnPremiseStop@0
+            displayName: 'OWASP Stop'
+            inputs:
+              KeyOwaspZapProxy: 'zap_key'
+              PortZapProxy: '8913'
+
+          - task: PublishTestResults@2
+            displayName: 'OWASP Results Publish'
+            inputs:
+              testResultsFormat: 'NUnit'
+              testResultsFiles: '*Report.xml'
+              mergeTestResults: true
+              testRunTitle: 'OWASP Report'      
+
+      - stage: Production
+        dependsOn: Test
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        displayName: Production Deployment
+        jobs: 
+        - deployment: DeployWeb
+          displayName: Deploy to Production Environment
+
+          environment: 
+            name: 'Production'
+
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - download: current
+                    artifact: drop
+                  
+                  - task: AzureWebApp@1
+                    displayName: 'Production Deployment'
+                    inputs:
+                        azureSubscription: 'eShopOnWeb'
+                        appType: webApp
+                        appName: ${{ parameters.WebsiteName }}
+                        package: '$(Agent.BuildDirectory)/drop/Web.zip'
+                        
